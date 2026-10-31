@@ -1,0 +1,215 @@
+name: Build lsportable
+
+# Manual only. By default the latest LSPatch release jar is packed (a minute). from_source builds
+# LSPatch itself first (a full Android + NDK build).
+on:
+  workflow_dispatch:
+    inputs:
+      from_source:
+        description: "Build LSPatch from source instead of packing its latest release jar"
+        type: boolean
+        required: false
+        default: false
+      lspatch_ref:
+        description: "With from_source: LSPatch git ref to build (branch, tag, or commit)"
+        required: false
+        default: "master"
+      create_release:
+        description: "Also create a draft GitHub Release with this build attached"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # write access is used only by the release step
+    permissions:
+      contents: write
+    steps:
+      # persist-credentials: false keeps the token out of .git/config, where the LSPatch
+      # build scripts could read it
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # LSPatch's pinned core submodule points to libxposed repos that return 404 now;
+      # the JingMatrix forks are the live ones. Set before checkout so its submodule init uses it.
+      - name: Work around LSPatch's stale nested submodule URLs
+        if: ${{ inputs.from_source }}
+        run: |
+          git config --global url."https://github.com/JingMatrix/libxposed-service.git".insteadOf \
+            "https://github.com/libxposed/service.git"
+          git config --global url."https://github.com/JingMatrix/libxposed-api.git".insteadOf \
+            "https://github.com/libxposed/api.git"
+
+      # full history: LSPatch derives its version code from the commit count
+      - name: Checkout LSPatch
+        if: ${{ inputs.from_source }}
+        uses: actions/checkout@v4
+        with:
+          repository: JingMatrix/LSPatch
+          ref: ${{ github.event.inputs.lspatch_ref }}
+          submodules: recursive
+          fetch-depth: 0
+          path: lspatch
+          persist-credentials: false
+
+      - name: Record LSPatch commit
+        if: ${{ inputs.from_source }}
+        id: lspatch_rev
+        run: echo "sha=$(git -C lspatch rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Pack the latest LSPatch release jar
+        if: ${{ !inputs.from_source }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          mkdir -p work
+          python3 lsportable-build/build_lsportable.py --work work --out work/lsportable | tee work/build.log
+
+      - name: Setup Gradle
+        if: ${{ inputs.from_source }}
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        if: ${{ inputs.from_source }}
+        uses: android-actions/setup-android@v4
+
+      - name: Setup ninja
+        if: ${{ inputs.from_source }}
+        uses: seanmiddleditch/gha-setup-ninja@v6
+        with:
+          version: 1.12.0
+
+      # LSPatch's own CI does this so CMake comes from the version its build asks for
+      - name: Remove Android's bundled cmake
+        if: ${{ inputs.from_source }}
+        run: rm -rf "$ANDROID_HOME/cmake"
+
+      # :jar only, without the :manager GUI app
+      - name: Build LSPatch jar
+        if: ${{ inputs.from_source }}
+        working-directory: lspatch
+        run: ./gradlew :jar:buildRelease --no-daemon
+
+      - name: Locate the built jar
+        if: ${{ inputs.from_source }}
+        id: find_jar
+        working-directory: lspatch
+        run: |
+          jar_path=$(ls out/release/lspatch-*-release.jar | head -1)
+          if [ -z "$jar_path" ]; then
+            echo "::error::no lspatch release jar found under out/release/"
+            exit 1
+          fi
+          echo "path=$(realpath "$jar_path")" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$jar_path")" >> "$GITHUB_OUTPUT"
+
+      # assets/ goes into lsportable as is; the rest is what D8 dexes
+      - name: Split the jar into assets and classes
+        if: ${{ inputs.from_source }}
+        run: |
+          mkdir -p work/assets
+          cd work/assets
+          unzip -q "${{ steps.find_jar.outputs.path }}" "assets/*"
+          cd ../..
+          cp "${{ steps.find_jar.outputs.path }}" work/lspatch-classes-only.jar
+          zip -q -d work/lspatch-classes-only.jar "assets/*"
+
+      - name: Compile LSPortableEntry
+        if: ${{ inputs.from_source }}
+        run: |
+          mkdir -p work/entry
+          javac --release 21 \
+            -cp "${{ steps.find_jar.outputs.path }}" \
+            -d work/entry \
+            lsportable-build/LSPortableEntry.java
+
+      # pinned R8: the SDK's bundled build-tools were too old to dex Java 21 bytecode
+      - name: Download R8
+        if: ${{ inputs.from_source }}
+        run: |
+          curl -fsSL -o r8.jar \
+            https://maven.google.com/com/android/tools/r8/9.4.27/r8-9.4.27.jar
+
+      # D8 needs --output to exist already
+      - name: Dex with D8
+        if: ${{ inputs.from_source }}
+        run: |
+          mkdir -p work/dex_out
+          java -cp r8.jar com.android.tools.r8.D8 \
+            --release \
+            --min-api 26 \
+            --output work/dex_out \
+            work/lspatch-classes-only.jar \
+            work/entry/LSPortableEntry.class
+
+      # Signing key = LSPatch's own default key, repacked from JKS to PKCS12 (Android reads
+      # PKCS12 only). The build fails here if upstream changes the key or its password.
+      - name: Convert LSPatch default key to PKCS12
+        if: ${{ inputs.from_source }}
+        run: |
+          keytool -importkeystore -noprompt \
+            -srckeystore work/assets/assets/keystore -srcstoretype JKS \
+            -srcstorepass 123456 -srckeypass 123456 -srcalias key0 \
+            -destkeystore work/signing.p12 -deststoretype PKCS12 \
+            -deststorepass 123456 -destkeypass 123456 -destalias key0
+          keytool -list -v -keystore work/signing.p12 -storepass 123456 | grep -E "Alias|Owner|SHA256"
+
+      - name: Assemble lsportable
+        if: ${{ inputs.from_source }}
+        run: |
+          python3 lsportable-build/build_lsportable.py assemble \
+            work/assets/assets \
+            work/dex_out/classes.dex \
+            work/signing.p12 \
+            work/lsportable
+
+      - name: Verify lsportable
+        run: python3 lsportable-build/verify_lsportable.py work/lsportable
+
+      - name: Report size
+        run: ls -la work/lsportable
+
+      - name: Upload lsportable
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsportable
+          path: work/lsportable
+          if-no-files-found: error
+
+      - name: Write release notes
+        if: ${{ inputs.create_release }}
+        env:
+          FROM_SOURCE: ${{ inputs.from_source }}
+          LSPATCH_REF: ${{ inputs.lspatch_ref }}
+          LSPATCH_SHA: ${{ steps.lspatch_rev.outputs.sha }}
+          JAR_NAME: ${{ steps.find_jar.outputs.name }}
+        run: |
+          if [ "$FROM_SOURCE" = "true" ]; then
+            echo "Built from [LSPatch $LSPATCH_REF](https://github.com/JingMatrix/LSPatch/tree/$LSPATCH_SHA), commit \`$LSPATCH_SHA\`, jar: \`$JAR_NAME\`." > work/notes.md
+          else
+            line=$(sed -n 's/^\[lsportable\] LSPatch release: //p' work/build.log | head -1)
+            echo "Packed from the [LSPatch release](https://github.com/JingMatrix/LSPatch/releases) $line." > work/notes.md
+          fi
+
+      # Happwner downloads the asset named exactly "lsportable" from the latest published
+      # release, so keep the name
+      - name: Create draft release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: lsportable-${{ github.run_number }}
+          name: "LSPortable build ${{ github.run_number }}"
+          body_path: work/notes.md
+          files: work/lsportable
